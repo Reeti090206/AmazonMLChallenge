@@ -1,0 +1,20 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large Datasets & Archives (strictly excluded from Git due to GitHub 100MB limit & competition rules)
+dataset/
+student_resource/
+*.zip
+*.tar.gz
+*.tsv
+output/
+
+# OS / IDE / Scratch artifacts
+scratch/
+.DS_Store
+Thumbs.db
+._*
+.vscode/
+.idea/
