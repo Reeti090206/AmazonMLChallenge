@@ -137,9 +137,7 @@ def main():
         )
         threshold = args.threshold or train_results["best_threshold"]
     else:
-        if args.threshold is None:
-            raise ValueError("--threshold is required when --skip-train is set")
-        threshold = args.threshold
+        threshold = args.threshold if args.threshold is not None else 0.70
         print(f"\n>>> Skipping training. Using threshold = {threshold}", flush=True)
 
     # ---- Phase 2: Test Prediction ----

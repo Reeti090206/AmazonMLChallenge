@@ -1,89 +1,85 @@
 """
-blocking.py — High-speed, high-precision candidate generation via country
-partitioning + rarity-ranked inverted indexing.
+blocking.py — High-recall, high-precision candidate generation via country
+partitioning + multi-key inverted indexing (IDF-weighted tokens, postal codes, and 3-grams).
 
 Design rationale
 ----------------
 1. Country blocking is 100% safe (0% country mismatches across true pairs).
-2. Within country, rare tokens (small posting lists) carry >95% of discriminatory
-   signal, whereas common tokens (high posting lists) create combinatorial explosion
-   and false positives.
-3. Tokens are sorted by postings length (rarest first). Postings are capped per token
-   and candidate pool stops accumulating once sufficiently populated.
-4. Exact clean-name hash lookup ensures zero candidate drops for entities whose tokens
-   were all high-frequency.
+2. Within country, rare tokens carry high IDF signals, while common tokens receive
+   proportionately lower weight, avoiding candidate pool pollution.
+3. Address postal codes and building numerics (>=4 digits) provide a complementary
+   orthogonal blocking key to recover renamed or abbreviated businesses.
+4. Character 3-grams serve as a fallback for short names with few token matches.
+5. Exact clean-name hash lookup guarantees zero candidate drops for clean matches.
 """
 
 import time
-from collections import Counter, defaultdict
-import pandas as pd
+from collections import defaultdict
 import numpy as np
+import pandas as pd
 
 
-def compute_high_freq_tokens(token_lists, max_df_ratio: float = 0.005) -> set:
-    """Identify tokens that appear in more than *max_df_ratio* of documents."""
-    doc_freq = Counter()
-    n_docs = 0
-    for tokens in token_lists:
-        n_docs += 1
-        for t in set(tokens):
-            doc_freq[t] += 1
-
-    threshold = int(n_docs * max_df_ratio)
-    high_freq = {t for t, f in doc_freq.items() if f > threshold}
-    return high_freq
-
-
-def build_inverted_index(entity_ids, token_lists, high_freq_tokens: set) -> dict:
-    """Build a token -> list of entity IDs inverted index, skipping high-freq tokens."""
-    index = defaultdict(list)
-    for eid, tokens in zip(entity_ids, token_lists):
-        for t in set(tokens):
-            if len(t) > 1 and t not in high_freq_tokens:
-                index[t].append(eid)
-    return dict(index)
+def _get_c3(s: str) -> list:
+    """Extract character 3-grams after removing spaces."""
+    s = s.replace(" ", "")
+    if len(s) >= 3:
+        return [s[i:i + 3] for i in range(len(s) - 2)]
+    return [s] if s else []
 
 
 def _generate_candidates_for_partition(
     s1_ids,
-    s1_token_lists,
-    s1_name_clean,
-    inv_index: dict,
-    s2s3_name_to_ids: dict,
-    max_candidates_per_entity: int = 25,
+    s1_tokens,
+    s1_names,
+    s1_nums,
+    name_index: dict,
+    token_idf: dict,
+    addr_num_index: dict,
+    num_idf: dict,
+    c3_index: dict,
+    s2s3_nc_map: dict,
+    max_freq: int,
+    max_candidates_per_entity: int = 50,
 ) -> dict:
     """Generate candidate S2/S3 IDs for each S1 entity in a single country partition."""
     candidates = {}
-    for s1_id, tokens, s1_nc in zip(s1_ids, s1_token_lists, s1_name_clean):
-        cand_counts = {}
 
-        # Prioritize rare, discriminative tokens first
-        valid_tokens = [t for t in tokens if t in inv_index]
-        if valid_tokens:
-            valid_tokens.sort(key=lambda t: len(inv_index[t]))
-            for t in valid_tokens:
-                postings = inv_index[t]
-                # If we already have candidates and this token has > 1500 hits, skip to preserve precision
-                if len(postings) > 1500 and len(cand_counts) >= 15:
-                    continue
-                for cand_id in postings[:1500]:
-                    cand_counts[cand_id] = cand_counts.get(cand_id, 0) + 1
-                if len(cand_counts) >= 150:
-                    break
+    for sid, tokens, name, nums in zip(s1_ids, s1_tokens, s1_names, s1_nums):
+        cand_scores = {}
 
-        # Fallback: exact match if no token hit
-        if not cand_counts and s1_nc:
-            exact_ids = s2s3_name_to_ids.get(s1_nc)
-            if exact_ids:
-                for cid in exact_ids:
-                    cand_counts[cid] = 100
+        # 1. Name tokens with precomputed IDF weighting
+        valid_tokens = [t for t in tokens if t in token_idf and len(name_index[t]) < max_freq]
+        for t in valid_tokens:
+            w = token_idf[t]
+            for cid in name_index[t][:3000]:
+                cand_scores[cid] = cand_scores.get(cid, 0.0) + w
 
-        if len(cand_counts) <= max_candidates_per_entity:
-            top = list(cand_counts.keys())
+        # 2. Address numeric / postal code matching (len >= 4)
+        for num in nums:
+            if num in num_idf and len(addr_num_index[num]) <= 2000:
+                w = num_idf[num]
+                for cid in addr_num_index[num]:
+                    cand_scores[cid] = cand_scores.get(cid, 0.0) + w
+
+        # 3. Fallback: Character 3-grams for entities with small candidate pool
+        if len(cand_scores) < 30 and name:
+            c3_list = [g for g in _get_c3(name) if g in c3_index and len(c3_index[g]) < 1500]
+            for g in c3_list:
+                for cid in c3_index[g]:
+                    cand_scores[cid] = cand_scores.get(cid, 0.0) + 1.0
+
+        # 4. Fallback: Exact clean-name match
+        if name and name in s2s3_nc_map:
+            for cid in s2s3_nc_map[name]:
+                cand_scores[cid] = cand_scores.get(cid, 0.0) + 100.0
+
+        # Top-K candidate selection
+        if len(cand_scores) <= max_candidates_per_entity:
+            top = list(cand_scores.keys())
         else:
-            top = sorted(cand_counts, key=cand_counts.get, reverse=True)[:max_candidates_per_entity]
+            top = sorted(cand_scores, key=cand_scores.get, reverse=True)[:max_candidates_per_entity]
 
-        candidates[s1_id] = top
+        candidates[sid] = top
 
     return candidates
 
@@ -92,7 +88,7 @@ def generate_candidates(
     s1_df: pd.DataFrame,
     s2s3_df: pd.DataFrame,
     max_df_ratio: float = 0.005,
-    max_candidates: int = 25,
+    max_candidates: int = 50,
 ) -> dict:
     """Generate candidate pairs for every S1 entity across country partitions."""
     t0 = time.time()
@@ -111,30 +107,55 @@ def generate_candidates(
             print(f"    {country}: {len(s1_c):,} S1 x 0 S2S3 -> 0 candidates", flush=True)
             continue
 
-        print(f"    Building index for {country} ({len(s2s3_c):,} records)...", flush=True)
-        high_freq = compute_high_freq_tokens(s2s3_c["name_tokens"].values, max_df_ratio)
+        print(f"    Building multi-key index for {country} ({len(s2s3_c):,} records)...", flush=True)
+        N = len(s2s3_c)
+        s2s3_eids = s2s3_c["entity_id"].values
+        s2s3_tokens = s2s3_c["name_tokens"].values
+        s2s3_names = s2s3_c["name_clean"].values
+        s2s3_nums = s2s3_c["addr_numerics"].values
 
-        inv_index = build_inverted_index(
-            s2s3_c["entity_id"].values, s2s3_c["name_tokens"].values, high_freq
-        )
+        name_index = defaultdict(list)
+        for eid, toks in zip(s2s3_eids, s2s3_tokens):
+            for t in set(toks):
+                if len(t) > 1:
+                    name_index[t].append(eid)
+
+        addr_num_index = defaultdict(list)
+        for eid, nums in zip(s2s3_eids, s2s3_nums):
+            for n in set(nums):
+                if len(n) >= 4:
+                    addr_num_index[n].append(eid)
+
+        c3_index = defaultdict(list)
+        for eid, nc in zip(s2s3_eids, s2s3_names):
+            if nc:
+                for g in set(_get_c3(nc)):
+                    c3_index[g].append(eid)
 
         s2s3_nc_map = defaultdict(list)
-        for eid, nc in zip(s2s3_c["entity_id"].values, s2s3_c["name_clean"].values):
+        for eid, nc in zip(s2s3_eids, s2s3_names):
             if nc:
                 s2s3_nc_map[nc].append(eid)
 
-        s1_blocking_tokens = [
-            [t for t in tokens if len(t) > 1 and t not in high_freq]
-            for tokens in s1_c["name_tokens"].values
-        ]
+        # Precompute IDF weights using math.log for high-speed indexing
+        import math
+        token_idf = {t: math.log((N + 1) / (len(p) + 1)) * 2.0 for t, p in name_index.items()}
+        num_idf = {n: math.log((N + 1) / (len(p) + 1)) * 1.5 for n, p in addr_num_index.items()}
+        max_freq = int(N * 0.02)
 
         print(f"    Retrieving candidates for {len(s1_c):,} entities in {country}...", flush=True)
         part_cands = _generate_candidates_for_partition(
             s1_c["entity_id"].values,
-            s1_blocking_tokens,
+            s1_c["name_tokens"].values,
             s1_c["name_clean"].values,
-            inv_index,
+            s1_c["addr_numerics"].values,
+            name_index,
+            token_idf,
+            addr_num_index,
+            num_idf,
+            c3_index,
             s2s3_nc_map,
+            max_freq,
             max_candidates,
         )
         all_candidates.update(part_cands)

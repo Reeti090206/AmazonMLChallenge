@@ -109,7 +109,7 @@ def parse_matched_ids(matched_str: str) -> list:
     Returns:
         A list of matched entity IDs, or an empty list for singletons.
     """
-    if not matched_str or matched_str.strip() == "":
+    if not isinstance(matched_str, str) or not matched_str.strip():
         return []
     return [x.strip() for x in matched_str.split(",") if x.strip()]
 
